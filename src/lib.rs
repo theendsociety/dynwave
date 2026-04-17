@@ -46,24 +46,89 @@ use ringbuf::{
     traits::{Producer, Split},
     HeapProd, HeapRb,
 };
-use rubato::{FftFixedInOut, Resampler, Sample};
+use rubato::{audioadapter::{Adapter, AdapterMut}, Fft, FixedSync, Resampler, Sample};
 
 struct AudioResampler<T: Sample> {
-    resampler: FftFixedInOut<T>,
+    resampler: Fft<T>,
     pre_resampled_buffer: Vec<T>,
     pre_resampled_split_buffers: [Vec<T>; 2],
     resample_process_buffers: [Vec<T>; 2],
     resampled_buffer: Vec<T>,
 }
 
-impl<T: Sample + SizedSample> AudioResampler<T> {
+struct ChannelSlicesAdapter<'a, T> {
+    channels: &'a [Vec<T>],
+    frames: usize,
+}
+
+impl<'a, T> ChannelSlicesAdapter<'a, T> {
+    fn new(channels: &'a [Vec<T>], frames: usize) -> Self {
+        Self { channels, frames }
+    }
+}
+
+unsafe impl<'a, T: Clone + 'a> Adapter<'a, T> for ChannelSlicesAdapter<'a, T> {
+    unsafe fn read_sample_unchecked(&self, channel: usize, frame: usize) -> T {
+        self.channels.get_unchecked(channel).get_unchecked(frame).clone()
+    }
+
+    fn channels(&self) -> usize {
+        self.channels.len()
+    }
+
+    fn frames(&self) -> usize {
+        self.frames
+    }
+}
+
+struct ChannelSlicesAdapterMut<'a, T> {
+    channels: &'a mut [Vec<T>],
+    frames: usize,
+}
+
+impl<'a, T> ChannelSlicesAdapterMut<'a, T> {
+    fn new(channels: &'a mut [Vec<T>], frames: usize) -> Self {
+        Self { channels, frames }
+    }
+}
+
+unsafe impl<'a, T: Clone + 'a> Adapter<'a, T> for ChannelSlicesAdapterMut<'a, T> {
+    unsafe fn read_sample_unchecked(&self, channel: usize, frame: usize) -> T {
+        self.channels.get_unchecked(channel).get_unchecked(frame).clone()
+    }
+
+    fn channels(&self) -> usize {
+        self.channels.len()
+    }
+
+    fn frames(&self) -> usize {
+        self.frames
+    }
+}
+
+unsafe impl<'a, T: Clone + 'a> AdapterMut<'a, T> for ChannelSlicesAdapterMut<'a, T> {
+    unsafe fn write_sample_unchecked(
+        &mut self,
+        channel: usize,
+        frame: usize,
+        value: &T,
+    ) -> bool {
+        let slot = self.channels.get_unchecked_mut(channel).get_unchecked_mut(frame);
+        *slot = value.clone();
+        false
+    }
+}
+
+impl<T: Sample + SizedSample + Clone> AudioResampler<T> {
     fn new(input_rate: usize, output_rate: usize) -> Result<Self, AudioPlayerError> {
-        let resampler = FftFixedInOut::<T>::new(
+        let resampler = Fft::<T>::new(
             input_rate,
             output_rate,
             // the number of samples for one video frame in 60 FPS
             input_rate / 60,
             2,
+            2,
+            FixedSync::Both,
         )?;
 
         Ok(Self {
@@ -121,18 +186,20 @@ impl<T: Sample + SizedSample> AudioResampler<T> {
             );
 
             self.resample_process_buffers[0].clear();
-            self.resample_process_buffers[0].clear();
+            self.resample_process_buffers[1].clear();
 
             let output_frames = self.resampler.output_frames_next();
             self.resample_process_buffers[0].resize(output_frames, T::EQUILIBRIUM);
             self.resample_process_buffers[1].resize(output_frames, T::EQUILIBRIUM);
 
+            let input_adapter = ChannelSlicesAdapter::new(&self.pre_resampled_split_buffers, frames);
+            let mut output_adapter = ChannelSlicesAdapterMut::new(
+                &mut self.resample_process_buffers,
+                output_frames,
+            );
+
             self.resampler
-                .process_into_buffer(
-                    &self.pre_resampled_split_buffers,
-                    &mut self.resample_process_buffers,
-                    None,
-                )
+                .process_into_buffer(&input_adapter, &mut output_adapter, None)
                 .unwrap();
 
             // resample
@@ -274,8 +341,6 @@ where
             .default_output_device()
             .ok_or(AudioPlayerError::NoOutputDevice)?;
 
-        let sample_rate = cpal::SampleRate(sample_rate);
-
         let conf = output_device
             .supported_output_configs()?
             .collect::<Vec<_>>();
@@ -336,8 +401,8 @@ where
                 used_conf.sample_rate(),
                 used_conf.sample_format(),
                 Some(AudioResampler::new(
-                    sample_rate.0 as usize,
-                    used_conf.sample_rate().0 as usize,
+                    sample_rate as usize,
+                    used_conf.sample_rate() as usize,
                 )?),
             )
         };
@@ -348,7 +413,7 @@ where
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let ring_buffer_len = buffer_size.store_for_samples(output_sample_rate.0 as usize, 2);
+        let ring_buffer_len = buffer_size.store_for_samples(output_sample_rate as usize, 2);
         let buffer = HeapRb::new(ring_buffer_len);
         let (buffer_producer, buffer_consumer) = buffer.split();
 
